@@ -54,12 +54,16 @@ contract DSCEngine is ReentrancyGuard {
     error DSCEngine__TokenAddressesandPriceFeedAddressesMustBeSameLength();
     error DSCEngine__NotAllowedToken();
     error DSCEngine__TransferFailed();
+    error DSCEngine__BreaksHealthFactor(uint256 healthFactor);
 
     //////////////////////
     // State Variables  //
     //////////////////////
     uint256 private constant ADDITIONAL_FEED_PRECISION = 1e10;
     uint256 private constant PRECISION = 1e18;
+    uint256 private constant LIQUIDATION_THRESHOLD = 50; // Needs to have double the collateral to DSC
+    uint256 private constant LIQUIDATION_PRECISION = 100;
+    uint256 private constant MIN_HEALTH_FACTOR = 1;
 
     mapping(address token => address priceFeed) private s_priceFeeds; // tokenToPriceFeed
     mapping(address user => mapping(address token => uint256 amount)) private s_collateralDeposited;
@@ -177,11 +181,23 @@ contract DSCEngine is ReentrancyGuard {
         // We need total DSC minted
         // We need total VALUE of collateral deposited
         (uint256 totalDscMinted, uint256 collateralValueInUsd) = _getAccountInformation(user);
+        // return (collateralValueInUsd / totalDscMinted); Not correct as this is 1:1 without a threshold
+        // $150 ETH / 100 DSC = 1.5
+        // $150 * 50 = 7500 / 100 = (75 / 100) < 1
+
+        // $1000 ETH / 100 DSC
+        // 1000 * 50 = 50,000 / 100 = 500 /100 = 5 which is > 1
+        uint256 collateralAdjustedForThreshold = (collateralValueInUsd * LIQUIDATION_THRESHOLD) / LIQUIDATION_PRECISION;
+        return ((collateralAdjustedForThreshold * PRECISION) / totalDscMinted);
     }
 
+    // 1. Check health factor (do they have enouugh collateral?)
+    // 2. Revert if they do not have enough!
     function _revertIfHealthFactorIsBroken(address user) internal view {
-        // 1. Check health factor (do they have enouugh collateral?)
-        // 2. Revert if they do not have enough!
+        uint256 userHealthFactor = _healthFactor(user);
+        if (userHealthFactor < MIN_HEALTH_FACTOR) {
+            revert DSCEngine__BreaksHealthFactor(userHealthFactor);
+        }
     }
 
     //////////////////////////////////////////
