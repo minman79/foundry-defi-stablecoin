@@ -57,6 +57,7 @@ contract DSCEngine is ReentrancyGuard {
     error DSCEngine__BreaksHealthFactor(uint256 healthFactor);
     error DSCEngine__MintFailed();
     error DSCEngine__HealthFactorOK();
+    error DSCEngine__HealthFactorNotImproved();
 
     //////////////////////
     // State Variables  //
@@ -79,7 +80,9 @@ contract DSCEngine is ReentrancyGuard {
     ////////////////
 
     event CollateralDeposited(address indexed user, address indexed token, uint256 indexed amount);
-    event CollateralRedeemed(address indexed user, address indexed token, uint256 indexed amount);
+    event CollateralRedeemed(
+        address indexed redeemedFrom, address indexed redeemedTo, address indexed token, uint256 amount
+    );
 
     ////////////////
     // Modifiers  //
@@ -178,13 +181,7 @@ contract DSCEngine is ReentrancyGuard {
         moreThanZero(amountOfCollateral)
         nonReentrant
     {
-        s_collateralDeposited[msg.sender][addressOfCollateral] -= amountOfCollateral;
-        emit CollateralRedeemed(msg.sender, addressOfCollateral, amountOfCollateral);
-        // We violate the CEI in this instance as it will be more gas efficient and it will revert the transaction if HealthFactor is broken after the pull
-        bool success = IERC20(addressOfCollateral).transfer(msg.sender, amountOfCollateral);
-        if (!success) {
-            revert DSCEngine__TransferFailed();
-        }
+        _redeemCollateral(addressOfCollateral, amountOfCollateral, msg.sender, msg.sender);
         _revertIfHealthFactorIsBroken(msg.sender);
     }
 
@@ -204,13 +201,8 @@ contract DSCEngine is ReentrancyGuard {
     }
 
     // As we are burning the dept, we do not need to check the healthFactor but adding as backup
-    function burnDsc(uint256 amountDscToBurn) public moreThanZero(amountDscToBurn) nonReentrant {
-        s_DSCMinted[msg.sender] -= amountDscToBurn;
-        bool success = i_dsc.transferFrom(msg.sender, address(this), amountDscToBurn);
-        if (!success) {
-            revert DSCEngine__TransferFailed();
-        }
-        i_dsc.burn(amountDscToBurn);
+    function burnDsc(uint256 amountDscToBurn) public moreThanZero(amountDscToBurn) {
+        _burnDsc(amountDscToBurn, msg.sender, msg.sender);
         _revertIfHealthFactorIsBroken(msg.sender); // probably not required as it would not be hit...
     }
 
@@ -252,13 +244,46 @@ contract DSCEngine is ReentrancyGuard {
         // We should sweep extra amount into a treasury
         uint256 bonusCollateral = (tokenAmountFromDeptCovered * LIQUIDATION_BONUS) / LIQUIDATION_PRECISION;
         uint256 totalCollateralToRedeem = tokenAmountFromDeptCovered + bonusCollateral;
-    }
+        _redeemCollateral(addressOfCollateral, totalCollateralToRedeem, userUnderCollateralized, msg.sender);
+        // We need to burn the DSC
+        _burnDsc(deptToCover, userUnderCollateralized, msg.sender);
 
-    function getHealthFactor() external view {}
+        // As the internal function does not check the healthFactor, we must perform a check
+        uint256 endingUserHealthFactor = _healthFactor(userUnderCollateralized);
+        if (endingUserHealthFactor <= startingUserHealthFactor) {
+            revert DSCEngine__HealthFactorNotImproved();
+        }
+        _revertIfHealthFactorIsBroken(msg.sender);
+    }
 
     //////////////////////////////////////////
     // Private and Internal View Functions  //
     //////////////////////////////////////////
+
+    /**
+     * @dev Low-level Internal function, do not call unless the function calling it is checking for health factors being broken
+     */
+    function _burnDsc(uint256 amountDscToBurn, address onBehalfOf, address dscFrom) private {
+        s_DSCMinted[onBehalfOf] -= amountDscToBurn;
+        bool success = i_dsc.transferFrom(dscFrom, address(this), amountDscToBurn);
+        // This condition is hypothtically unreachable as transFrom function will create the revert if issues
+        if (!success) {
+            revert DSCEngine__TransferFailed();
+        }
+        i_dsc.burn(amountDscToBurn);
+    }
+
+    function _redeemCollateral(address addressOfCollateral, uint256 amountOfCollateral, address from, address to)
+        private
+    {
+        s_collateralDeposited[from][addressOfCollateral] -= amountOfCollateral;
+        emit CollateralRedeemed(from, to, addressOfCollateral, amountOfCollateral);
+        // We violate the CEI in this instance as it will be more gas efficient and it will revert the transaction if HealthFactor is broken after the pull
+        bool success = IERC20(addressOfCollateral).transfer(to, amountOfCollateral);
+        if (!success) {
+            revert DSCEngine__TransferFailed();
+        }
+    }
 
     function _getAccountInformation(address user)
         private
@@ -284,7 +309,7 @@ contract DSCEngine is ReentrancyGuard {
         // $1000 ETH / 100 DSC
         // 1000 * 50 = 50,000 / 100 = 500 /100 = 5 which is > 1
         uint256 collateralAdjustedForThreshold = (collateralValueInUsd * LIQUIDATION_THRESHOLD) / LIQUIDATION_PRECISION;
-        return ((collateralAdjustedForThreshold * PRECISION) / totalDscMinted);
+        return ((collateralAdjustedForThreshold * PRECISION) / totalDscMinted); // BUG ==> totalDscMinted can not equal 0
     }
 
     // 1. Check health factor (do they have enouugh collateral?)
@@ -331,5 +356,9 @@ contract DSCEngine is ReentrancyGuard {
         // 1 ETH = $1000
         // The returned value from chainlink will be 1000 * 1e8
         return ((uint256(price) * ADDITIONAL_FEED_PRECISION) * amount) / PRECISION; // ((1000 * 1e8 * (1e10)) * 1000 * 1e18) which means we are at 1e36, so we need to divide by 1e18 to return back to 1e18
+    }
+
+    function getHealthFactor(address user) external view returns (uint256 userHealthFactor) {
+        return _healthFactor(user);
     }
 }
