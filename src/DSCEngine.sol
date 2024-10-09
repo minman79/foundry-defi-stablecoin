@@ -77,6 +77,7 @@ contract DSCEngine is ReentrancyGuard {
     ////////////////
 
     event CollateralDeposited(address indexed user, address indexed token, uint256 indexed amount);
+    event CollateralRedeemed(address indexed user, address indexed token, uint256 indexed amount);
 
     ////////////////
     // Modifiers  //
@@ -118,6 +119,13 @@ contract DSCEngine is ReentrancyGuard {
     // External Functions  //
     /////////////////////////
 
+    /**
+     *
+     * @param addressOfCollateral The address of the token to deposit as collateral
+     * @param amountOfCollateral The amount of collateral to deposit
+     * @param amountDscToMint The amount of Decentralized StableCoin to mint
+     * @notice This function will deposit your collateral and mint DSC in one transaction
+     */
     function depositCollateralAndMintDsc(
         address addressOfCollateral,
         uint256 amountOfCollateral,
@@ -147,9 +155,36 @@ contract DSCEngine is ReentrancyGuard {
         }
     }
 
-    function redeemCollateralForDsc() external {}
+    /**
+     * @param addressOfCollateral The address of the token to redeem as collateral
+     * @param amountOfCollateral The amount of collateral to redeem
+     * @param amountDscToBurn The amount of Decentralized StableCoin to burn
+     * @notice This function burns DSC and redeems underlying collateral in one transaction
+     */
+    function redeemCollateralForDsc(address addressOfCollateral, uint256 amountOfCollateral, uint256 amountDscToBurn)
+        external
+    {
+        burnDsc(amountDscToBurn);
+        redeemCollateral(addressOfCollateral, amountOfCollateral);
+        // redeemCollateral already checks HealthFactor, so no need to check here
+    }
 
-    function redeemCollateral() external {}
+    // In order to redeem collateral:
+    // 1. Health factor must remain over 1 AFTER collateral is pulled out
+    function redeemCollateral(address addressOfCollateral, uint256 amountOfCollateral)
+        public
+        moreThanZero(amountOfCollateral)
+        nonReentrant
+    {
+        s_collateralDeposited[msg.sender][addressOfCollateral] -= amountOfCollateral;
+        emit CollateralRedeemed(msg.sender, addressOfCollateral, amountOfCollateral);
+        // We violate the CEI in this instance as it will be more gas efficient and it will revert the transaction if HealthFactor is broken after the pull
+        bool success = IERC20(addressOfCollateral).transfer(msg.sender, amountOfCollateral);
+        if (!success) {
+            revert DSCEngine__TransferFailed();
+        }
+        _revertIfHealthFactorIsBroken(msg.sender);
+    }
 
     /**
      * @notice Follows CEI
@@ -166,7 +201,16 @@ contract DSCEngine is ReentrancyGuard {
         }
     }
 
-    function burnDsc() external {}
+    // As we are burning the dept, we do not need to check the healthFactor but adding as backup
+    function burnDsc(uint256 amountDscToBurn) public moreThanZero(amountDscToBurn) nonReentrant {
+        s_DSCMinted[msg.sender] -= amountDscToBurn;
+        bool success = i_dsc.transferFrom(msg.sender, address(this), amountDscToBurn);
+        if (!success) {
+            revert DSCEngine__TransferFailed();
+        }
+        i_dsc.burn(amountDscToBurn);
+        _revertIfHealthFactorIsBroken(msg.sender); // probably not required as it would not be hit...
+    }
 
     function liquidate() external {}
 
